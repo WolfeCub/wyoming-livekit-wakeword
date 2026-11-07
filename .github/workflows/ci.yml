@@ -1,0 +1,83 @@
+name: CI
+
+on: push
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Release version
+        id: meta
+        if: github.ref_name == github.event.repository.default_branch
+        run: |
+          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          # ghcr rejects uppercase.
+          echo "repository=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        if: github.ref_name == github.event.repository.default_branch
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only a VERSION not in the registry yet gets pushed.
+      - name: Is the version already published?
+        id: published
+        if: github.ref_name == github.event.repository.default_branch
+        uses: tyriis/docker-image-tag-exists@v3.0.1
+        with:
+          registry: ghcr.io
+          repository: ${{ steps.meta.outputs.repository }}
+          tag: ${{ steps.meta.outputs.version }}
+
+      - uses: nixbuild/nix-quick-install-action@v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'Cargo.lock', '.github/workflows/ci.yml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size: 0
+
+      # The cache step GCs everything that isn't a GC root before saving, and each
+      # out-link is one:
+      #   image         the app (its check phase runs the tests), deps and model
+      #   image.copyTo  the patched skopeo the push uses; not in cache.nixos.org
+      #   flake-inputs  nixpkgs and the other input sources
+      - name: Build image
+        run: |
+          nix build .#image -L
+          nix build .#image.copyTo -o "$RUNNER_TEMP/push-tools" -L
+          nix build .#flake-inputs -o "$RUNNER_TEMP/flake-inputs" -L
+
+      - name: Push to ghcr.io
+        if: >-
+          github.ref_name == github.event.repository.default_branch
+          && steps.published.outputs.tag == 'not found'
+        run: |
+          # skopeo from nixpkgs refuses the runner's v1 registries.conf.
+          printf 'unqualified-search-registries = ["docker.io"]\n' > "$RUNNER_TEMP/registries.conf"
+          export CONTAINERS_REGISTRIES_CONF="$RUNNER_TEMP/registries.conf"
+
+          image="ghcr.io/${{ steps.meta.outputs.repository }}"
+          for tag in "${{ steps.meta.outputs.version }}" "${{ github.sha }}" latest; do
+            nix run .#image.copyTo -- \
+              "docker://$image:$tag" \
+              --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}"
+          done
