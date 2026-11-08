@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use livekit_wakeword::WakeWordModel;
-use log::info;
+use log::{debug, info};
 
 use crate::audio::RATE;
 
@@ -31,10 +31,13 @@ impl Models {
 
         let models = Self { paths };
         for name in models.names() {
-            let started = Instant::now();
             models.load(name)?;
-            info!("loaded {name} in {:.2?}", started.elapsed());
         }
+        info!(
+            "models in {}: {}",
+            dir.display(),
+            models.names().collect::<Vec<_>>().join(", ")
+        );
         Ok(models)
     }
 
@@ -48,6 +51,10 @@ impl Models {
 
     pub fn load(&self, name: &str) -> anyhow::Result<WakeWordModel> {
         let path = &self.paths[name];
-        WakeWordModel::new(&[path], RATE).with_context(|| format!("loading {}", path.display()))
+        let started = Instant::now();
+        let model = WakeWordModel::new(&[path], RATE)
+            .with_context(|| format!("loading {}", path.display()))?;
+        debug!("loaded {name} in {:.2?}", started.elapsed());
+        Ok(model)
     }
 }

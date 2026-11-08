@@ -14,6 +14,6 @@ pub fn samples(event: &Event) -> anyhow::Result<Vec<i16>> {
     Ok(samples.iter().map(|&b| i16::from_le_bytes(b)).collect())
 }
 
-pub fn millis(samples: usize) -> u64 {
-    samples as u64 * 1000 / u64::from(RATE)
+pub fn millis(samples: u64) -> u64 {
+    samples * 1000 / u64::from(RATE)
 }

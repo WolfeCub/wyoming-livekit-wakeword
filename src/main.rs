@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use livekit_wakeword::FRAME_SAMPLES;
 use log::{debug, info, warn};
 
 use crate::detector::Settings;
@@ -37,7 +38,8 @@ struct Args {
     threshold: f32,
 
     /// Consecutive 80 ms activations needed for a detection.
-    #[arg(long, env = "TRIGGER_LEVEL", default_value_t = 1)]
+    #[arg(long, env = "TRIGGER_LEVEL", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..))]
     trigger_level: u32,
 
     /// Seconds before the same wake word can be detected again.
@@ -51,8 +53,13 @@ fn main() -> anyhow::Result<()> {
     let settings = Settings {
         threshold: args.threshold,
         trigger_level: args.trigger_level,
-        refractory: Duration::from_secs_f64(args.refractory_seconds),
+        refractory_frames: (args.refractory_seconds * f64::from(audio::RATE) / FRAME_SAMPLES as f64)
+            .ceil() as u32,
     };
+    info!(
+        "wyoming-livekit-wakeword {VERSION}: threshold {}, trigger level {}, refractory {} s",
+        args.threshold, args.trigger_level, args.refractory_seconds
+    );
 
     let models = Arc::new(Models::scan(&args.model_dir)?);
     let listener =
@@ -60,7 +67,15 @@ fn main() -> anyhow::Result<()> {
     info!("listening on {}", args.listen);
 
     for stream in listener.incoming() {
-        let stream = stream?;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                // E.g. out of file descriptors, which won't clear right away.
+                warn!("accepting a connection: {err}");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         let models = models.clone();
         std::thread::spawn(move || {
             let peer = stream
@@ -68,7 +83,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|a| a.to_string())
                 .unwrap_or_default();
             debug!("{peer} connected");
-            match connection::handle(stream, &models, settings) {
+            match connection::handle(stream, &peer, &models, settings) {
                 Ok(()) => debug!("{peer} disconnected"),
                 Err(err) => warn!("{peer}: {err:#}"),
             }

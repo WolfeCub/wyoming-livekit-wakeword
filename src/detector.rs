@@ -1,21 +1,27 @@
-use std::time::{Duration, Instant};
-
-use livekit_wakeword::WakeWordModel;
+use livekit_wakeword::{FRAME_SAMPLES, WakeWordModel};
+use log::trace;
 
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub threshold: f32,
     pub trigger_level: u32,
-    pub refractory: Duration,
+    /// In 80 ms frames.
+    pub refractory_frames: u32,
 }
 
-/// Turns one model's scores into detections.
+pub struct Detection {
+    pub score: f32,
+    /// Samples into the chunk at which the detecting frame ended.
+    pub offset: usize,
+}
+
+/// Runs one model over the audio, one 80 ms frame at a time.
 pub struct Detector {
     pub name: String,
     model: WakeWordModel,
-    settings: Settings,
-    triggers_left: u32,
-    last_triggered: Option<Instant>,
+    trigger: Trigger,
+    /// Samples short of a full frame, kept for the next chunk.
+    pending: Vec<i16>,
 }
 
 impl Detector {
@@ -23,42 +29,115 @@ impl Detector {
         Self {
             name,
             model,
-            settings,
-            triggers_left: settings.trigger_level,
-            last_triggered: None,
+            trigger: Trigger::new(settings),
+            pending: Vec::with_capacity(FRAME_SAMPLES),
         }
     }
 
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.model.reset()?;
-        self.triggers_left = self.settings.trigger_level;
-        self.last_triggered = None;
+        self.trigger = Trigger::new(self.trigger.settings);
+        self.pending.clear();
         Ok(())
     }
 
-    /// Returns the score when this chunk completes a detection.
-    pub fn feed(&mut self, samples: &[i16]) -> anyhow::Result<Option<f32>> {
-        // Fed during the refractory period too, so its state keeps up.
-        let score = self.model.predict(samples)?[&self.name];
+    /// Returns the detections this chunk completes.
+    pub fn feed(&mut self, samples: &[i16]) -> anyhow::Result<Vec<Detection>> {
+        // The model scores a chunk by the best of the frames it completes, and
+        // scores 0 when it completes none, so feed it exactly one frame at a time.
+        let carried = self.pending.len();
+        self.pending.extend_from_slice(samples);
+        let mut detections = Vec::new();
+        let (frames, _) = self.pending.as_chunks::<FRAME_SAMPLES>();
+        let used = frames.len() * FRAME_SAMPLES;
+        for (i, frame) in frames.iter().enumerate() {
+            let score = self.model.predict(frame)?[&self.name];
+            trace!("{} {score:.3}", self.name);
+            if self.trigger.frame(score) {
+                self.model.reset()?;
+                let offset = (i + 1) * FRAME_SAMPLES - carried;
+                detections.push(Detection { score, offset });
+            }
+        }
+        self.pending.drain(..used);
+        Ok(detections)
+    }
+}
 
-        if self
-            .last_triggered
-            .is_some_and(|t| t.elapsed() < self.settings.refractory)
-        {
-            return Ok(None);
+/// Turns per-frame scores into detections.
+struct Trigger {
+    settings: Settings,
+    activations: u32,
+    refractory_left: u32,
+}
+
+impl Trigger {
+    fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            activations: 0,
+            refractory_left: 0,
+        }
+    }
+
+    /// Returns whether this frame's score completes a detection.
+    fn frame(&mut self, score: f32) -> bool {
+        if self.refractory_left > 0 {
+            self.refractory_left -= 1;
+            return false;
         }
         if score <= self.settings.threshold {
-            self.triggers_left = self.settings.trigger_level;
-            return Ok(None);
+            self.activations = 0;
+            return false;
         }
-        self.triggers_left = self.triggers_left.saturating_sub(1);
-        if self.triggers_left > 0 {
-            return Ok(None);
+        self.activations += 1;
+        if self.activations < self.settings.trigger_level {
+            return false;
         }
+        self.activations = 0;
+        self.refractory_left = self.settings.refractory_frames;
+        true
+    }
+}
 
-        self.model.reset()?;
-        self.triggers_left = self.settings.trigger_level;
-        self.last_triggered = Some(Instant::now());
-        Ok(Some(score))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detections(settings: Settings, scores: &[f32]) -> Vec<usize> {
+        let mut trigger = Trigger::new(settings);
+        (0..scores.len())
+            .filter(|&i| trigger.frame(scores[i]))
+            .collect()
+    }
+
+    const SETTINGS: Settings = Settings {
+        threshold: 0.5,
+        trigger_level: 1,
+        refractory_frames: 0,
+    };
+
+    #[test]
+    fn threshold() {
+        assert_eq!(detections(SETTINGS, &[0.1, 0.5, 0.6, 0.2]), [2]);
+    }
+
+    #[test]
+    fn trigger_level() {
+        let settings = Settings {
+            trigger_level: 3,
+            ..SETTINGS
+        };
+        let scores = [0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+        assert_eq!(detections(settings, &scores), [5, 8]);
+    }
+
+    #[test]
+    fn refractory() {
+        let settings = Settings {
+            refractory_frames: 2,
+            ..SETTINGS
+        };
+        assert_eq!(detections(settings, &[0.9; 7]), [0, 3, 6]);
     }
 }
