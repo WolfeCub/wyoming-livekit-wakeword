@@ -1,11 +1,13 @@
 use std::io::{BufReader, BufWriter};
 use std::net::TcpStream;
+use std::time::Instant;
 
 use log::{debug, info, warn};
 use serde_json::{Value, json};
 
 use crate::detector::{Detector, Settings};
 use crate::models::Models;
+use crate::verifier::Verifier;
 use crate::{audio, describe, wyoming};
 
 /// Serves one client until it disconnects.
@@ -14,6 +16,7 @@ pub fn handle(
     peer: &str,
     models: &Models,
     settings: Settings,
+    verifier: Option<&Verifier>,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
@@ -21,9 +24,11 @@ pub fn handle(
         peer,
         models,
         settings,
+        verifier,
         detectors: Vec::new(),
         detected: false,
         samples: 0,
+        history: Vec::new(),
     };
 
     while let Some(event) = wyoming::read(&mut reader)? {
@@ -50,10 +55,13 @@ struct Session<'a> {
     peer: &'a str,
     models: &'a Models,
     settings: Settings,
+    verifier: Option<&'a Verifier>,
     detectors: Vec<Detector>,
     detected: bool,
     /// Samples since audio-start.
     samples: u64,
+    /// The latest audio, for the verifier.
+    history: Vec<i16>,
 }
 
 impl Session<'_> {
@@ -91,6 +99,7 @@ impl Session<'_> {
     fn start(&mut self) -> anyhow::Result<()> {
         self.detected = false;
         self.samples = 0;
+        self.history.clear();
         for detector in &mut self.detectors {
             detector.reset()?;
         }
@@ -104,6 +113,11 @@ impl Session<'_> {
             self.detect(None)?;
         }
 
+        let start = self.history.len();
+        if self.verifier.is_some() {
+            self.history.extend_from_slice(samples);
+        }
+
         let mut detections = Vec::new();
         for detector in &mut self.detectors {
             for detection in detector.feed(samples)? {
@@ -112,12 +126,45 @@ impl Session<'_> {
                     "{}: detected {} at {timestamp} ms (score {:.3})",
                     self.peer, detector.name, detection.score
                 );
+                if let Some(verifier) = self.verifier {
+                    let end = start + detection.offset;
+                    let window = &self.history[end.saturating_sub(verifier.window)..end];
+                    if !confirmed(self.peer, verifier, &detector.name, window) {
+                        continue;
+                    }
+                }
                 detections.push(json!({ "name": detector.name, "timestamp": timestamp }));
             }
+        }
+
+        if let Some(verifier) = self.verifier {
+            let excess = self.history.len().saturating_sub(verifier.window);
+            self.history.drain(..excess);
         }
 
         self.detected |= !detections.is_empty();
         self.samples += samples.len() as u64;
         Ok(detections)
+    }
+}
+
+/// Whether the verifier confirms a detection. Any failure to verify drops it.
+fn confirmed(peer: &str, verifier: &Verifier, name: &str, window: &[i16]) -> bool {
+    let started = Instant::now();
+    let verdict = verifier.verify(name, window);
+    let elapsed = started.elapsed().as_millis();
+    match verdict {
+        Ok(true) => {
+            info!("{peer}: verifier accepted {name} ({elapsed} ms)");
+            true
+        }
+        Ok(false) => {
+            info!("{peer}: verifier rejected {name} ({elapsed} ms)");
+            false
+        }
+        Err(err) => {
+            warn!("{peer}: verifying {name}: {err:#}, dropping the detection");
+            false
+        }
     }
 }

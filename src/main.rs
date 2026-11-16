@@ -3,6 +3,7 @@ mod connection;
 mod describe;
 mod detector;
 mod models;
+mod verifier;
 mod wyoming;
 
 use std::net::TcpListener;
@@ -17,6 +18,7 @@ use log::{debug, info, warn};
 
 use crate::detector::Settings;
 use crate::models::Models;
+use crate::verifier::Verifier;
 
 // Not the Cargo version: bumping that rebuilds every dependency in Nix.
 const VERSION: &str = include_str!("../VERSION").trim_ascii();
@@ -45,6 +47,14 @@ struct Args {
     /// Seconds before the same wake word can be detected again.
     #[arg(long, env = "REFRACTORY_SECONDS", default_value_t = 2.0)]
     refractory_seconds: f64,
+
+    /// Wyoming wake word verifier (host:port) that must confirm each detection.
+    #[arg(long, env = "VERIFIER")]
+    verifier: Option<String>,
+
+    /// Seconds of audio up to the detection sent to the verifier.
+    #[arg(long, env = "VERIFY_SECONDS", default_value_t = 1.4)]
+    verify_seconds: f64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,6 +71,16 @@ fn main() -> anyhow::Result<()> {
         args.threshold, args.trigger_level, args.refractory_seconds
     );
 
+    let verifier = args.verifier.map(|address| {
+        info!(
+            "verifying detections with {address} on {} s of audio",
+            args.verify_seconds
+        );
+        Arc::new(Verifier {
+            address,
+            window: (args.verify_seconds * f64::from(audio::RATE)) as usize,
+        })
+    });
     let models = Arc::new(Models::scan(&args.model_dir)?);
     let listener =
         TcpListener::bind(&args.listen).with_context(|| format!("binding {}", args.listen))?;
@@ -77,13 +97,14 @@ fn main() -> anyhow::Result<()> {
             }
         };
         let models = models.clone();
+        let verifier = verifier.clone();
         std::thread::spawn(move || {
             let peer = stream
                 .peer_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_default();
             debug!("{peer} connected");
-            match connection::handle(stream, &peer, &models, settings) {
+            match connection::handle(stream, &peer, &models, settings, verifier.as_deref()) {
                 Ok(()) => debug!("{peer} disconnected"),
                 Err(err) => warn!("{peer}: {err:#}"),
             }

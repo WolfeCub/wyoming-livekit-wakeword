@@ -47,10 +47,23 @@ pub fn read(reader: &mut impl BufRead) -> io::Result<Option<Event>> {
 }
 
 pub fn write(writer: &mut impl Write, kind: &str, data: Value) -> io::Result<()> {
+    write_payload(writer, kind, data, &[])
+}
+
+pub fn write_payload(
+    writer: &mut impl Write,
+    kind: &str,
+    data: Value,
+    payload: &[u8],
+) -> io::Result<()> {
     let data = serde_json::to_vec(&data)?;
-    let header = json!({ "type": kind, "version": VERSION, "data_length": data.len() });
+    let mut header = json!({ "type": kind, "version": VERSION, "data_length": data.len() });
+    if !payload.is_empty() {
+        header["payload_length"] = payload.len().into();
+    }
     serde_json::to_writer(&mut *writer, &header)?;
     writer.write_all(b"\n")?;
     writer.write_all(&data)?;
+    writer.write_all(payload)?;
     writer.flush()
 }
